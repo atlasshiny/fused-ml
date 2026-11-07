@@ -1,5 +1,30 @@
 [project]
 name = "fused-ml"
 version = "0.1.0"
+description = "An open-source fused kernel library for efficient memory-throughput machine learning operations."
+readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "torch==2.15.0",
+    "triton==3.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.uv]
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# The package is not installed yet (no build backend), so run from the repo root.
+pythonpath = ["."]
