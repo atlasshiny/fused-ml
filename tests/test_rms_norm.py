@@ -118,6 +118,84 @@ def test_float64_input_matches_reference():
     assert y.dtype == torch.float64
     torch.testing.assert_close(y, _reference(x, weight), rtol=1e-4, atol=1e-5)
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@requires_cuda
+def test_backward_large_hidden_dim_multiple_tiles(dtype):
+    """H larger than BLOCK_H exercises the tiled dx/dw paths."""
+    torch.manual_seed(0)
+    batch, hidden = 8, 4096
+    x = torch.randn(batch, hidden, device="cuda", dtype=dtype, requires_grad=True)
+    weight = torch.randn(hidden, device="cuda", dtype=dtype, requires_grad=True)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight_ref).backward(grad_out)
+
+    tol = _tolerance(dtype)
+    torch.testing.assert_close(x.grad, x_ref.grad, **tol)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, **tol)
+
+
+@requires_cuda
+def test_backward_many_rows_reduces_partials():
+    """B > 256 gives more than one row per dW program and several partials."""
+    torch.manual_seed(0)
+    batch, hidden = 1024, 256
+    x = torch.randn(batch, hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight_ref).backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-4, atol=1e-5)
+
+
+@requires_cuda
+def test_backward_3d_input():
+    torch.manual_seed(0)
+    seq, batch, hidden = 4, 8, 512
+    x = torch.randn(seq, batch, hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight_ref).backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-4, atol=1e-5)
+
+
+@requires_cuda
+def test_backward_skips_weight_grad_when_not_needed():
+    """dW is not computed when the gain is frozen."""
+    torch.manual_seed(0)
+    x = torch.randn((16, 256), device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(256, device="cuda", dtype=torch.float32, requires_grad=False)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    assert weight.grad is None
+    x_ref = x.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight).backward(grad_out)
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
+
+
 def test_rejects_invalid_input_rank():
     x = torch.randn((2, 2, 2, 2))
     weight = torch.randn(2)
