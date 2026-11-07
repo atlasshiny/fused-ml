@@ -9,10 +9,15 @@ import triton
 from fused_ml.ops import (
     _rms_norm_bwd_dw_kernel,
     _rms_norm_bwd_dx_kernel,
+    _rms_norm_bwd_fused_kernel,
     _rms_norm_fwd_kernel,
 )
 
 _MAX_PARTIAL_BLOCKS = 256
+
+# The fused backward keeps one full row of x/dy plus the dW accumulator in
+# registers, so it is only used while the row still fits comfortably.
+_MAX_FUSED_H = 8192
 
 def _to_2d(x: torch.Tensor) -> tuple[torch.Tensor, torch.Size]:
     """Flatten a 1D/2D/3D tensor to 2D ``[B, H]``.
@@ -142,48 +147,34 @@ class _RMSNormFunction(torch.autograd.Function):
         g, _ = _to_2d(grad_out)
         B, H = x.shape
 
-        BLOCK_H = min(1024, triton.next_power_of_2(H))
-        SINGLE_PASS = H <= BLOCK_H
-        num_warps = 8 if H >= 4096 else 4
-
         dx = torch.empty_like(x)
-        _rms_norm_bwd_dx_kernel[(B,)](
-            x,
-            weight,
-            g,
-            dx,
-            rstd,
-            stride_x_b=x.stride(0),
-            stride_x_h=x.stride(1),
-            stride_dy_b=g.stride(0),
-            stride_dy_h=g.stride(1),
-            stride_dx_b=dx.stride(0),
-            stride_dx_h=dx.stride(1),
-            H=H,
-            BLOCK_H=BLOCK_H,
-            SINGLE_PASS=SINGLE_PASS,
-            num_warps=num_warps,
-            num_stages=1 if SINGLE_PASS else 2,
-        )
-
+        needs_weight_grad = ctx.needs_input_grad[1]
         grad_weight = None
-        if ctx.needs_input_grad[1]:
+
+        # Fast path: one kernel produces dx and the dW partials from a single
+        # read of x/dy. The whole row has to fit in one tile for that.
+        if needs_weight_grad and H <= _MAX_FUSED_H:
+            BLOCK_H = triton.next_power_of_2(H)
+            num_warps = 4 if BLOCK_H <= 4096 else 8
             rows_per_program = max(1, triton.cdiv(B, _MAX_PARTIAL_BLOCKS))
             num_row_blocks = triton.cdiv(B, rows_per_program)
-            num_col_blocks = triton.cdiv(H, BLOCK_H)
 
             partials = torch.empty(
                 (num_row_blocks, H), device=x.device, dtype=torch.float32
             )
-            _rms_norm_bwd_dw_kernel[(num_col_blocks, num_row_blocks)](
+            _rms_norm_bwd_fused_kernel[(num_row_blocks,)](
                 x,
+                weight,
                 g,
+                dx,
                 rstd,
                 partials,
                 stride_x_b=x.stride(0),
                 stride_x_h=x.stride(1),
                 stride_dy_b=g.stride(0),
                 stride_dy_h=g.stride(1),
+                stride_dx_b=dx.stride(0),
+                stride_dx_h=dx.stride(1),
                 stride_dw_b=partials.stride(0),
                 stride_dw_h=partials.stride(1),
                 B=B,
@@ -194,6 +185,58 @@ class _RMSNormFunction(torch.autograd.Function):
                 num_stages=1,
             )
             grad_weight = partials.sum(dim=0).to(weight.dtype)
+        else:
+            # Fallback: large rows stream in tiles, and a frozen gain skips dW.
+            BLOCK_H = min(1024, triton.next_power_of_2(H))
+            SINGLE_PASS = H <= BLOCK_H
+            num_warps = 8 if H >= 4096 else 4
+
+            _rms_norm_bwd_dx_kernel[(B,)](
+                x,
+                weight,
+                g,
+                dx,
+                rstd,
+                stride_x_b=x.stride(0),
+                stride_x_h=x.stride(1),
+                stride_dy_b=g.stride(0),
+                stride_dy_h=g.stride(1),
+                stride_dx_b=dx.stride(0),
+                stride_dx_h=dx.stride(1),
+                H=H,
+                BLOCK_H=BLOCK_H,
+                SINGLE_PASS=SINGLE_PASS,
+                num_warps=num_warps,
+                num_stages=1 if SINGLE_PASS else 2,
+            )
+
+            if needs_weight_grad:
+                rows_per_program = max(1, triton.cdiv(B, _MAX_PARTIAL_BLOCKS))
+                num_row_blocks = triton.cdiv(B, rows_per_program)
+                num_col_blocks = triton.cdiv(H, BLOCK_H)
+
+                partials = torch.empty(
+                    (num_row_blocks, H), device=x.device, dtype=torch.float32
+                )
+                _rms_norm_bwd_dw_kernel[(num_col_blocks, num_row_blocks)](
+                    x,
+                    g,
+                    rstd,
+                    partials,
+                    stride_x_b=x.stride(0),
+                    stride_x_h=x.stride(1),
+                    stride_dy_b=g.stride(0),
+                    stride_dy_h=g.stride(1),
+                    stride_dw_b=partials.stride(0),
+                    stride_dw_h=partials.stride(1),
+                    B=B,
+                    H=H,
+                    ROWS_PER_PROGRAM=rows_per_program,
+                    BLOCK_H=BLOCK_H,
+                    num_warps=num_warps,
+                    num_stages=1,
+                )
+                grad_weight = partials.sum(dim=0).to(weight.dtype)
 
         return (
             dx.to(grad_out.dtype).reshape_as(grad_out),
