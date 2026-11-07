@@ -124,13 +124,17 @@ class _RMSNormFunction(torch.autograd.Function):
         g, _ = _to_2d(grad_out)
         H = x.shape[-1]
 
-        rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + ctx.eps)
+        x_f = x.float()
+        g_f = g.float()
+        w_f = weight.float()
+
+        rstd = torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + ctx.eps)
         # dx = rstd * w * dy - (rstd^3 / H) * x * sum(dy * w * x)
-        gx = g * rstd * weight
-        proj = (g * weight * x).sum(dim=-1, keepdim=True)
-        gx = gx - (rstd.pow(3) / H) * x * proj
-        gw = (g * x * rstd).sum(dim=0)
-        return gx.reshape_as(grad_out), gw, None
+        gx = g_f * rstd * w_f
+        proj = (g_f * w_f * x_f).sum(dim=-1, keepdim=True)
+        gx = gx - (rstd.pow(3) / H) * x_f * proj
+        gw = (g_f * x_f * rstd).sum(dim=0)
+        return gx.to(grad_out.dtype).reshape_as(grad_out), gw.to(weight.dtype), None
 
 def rms_norm(
     x: torch.Tensor,
