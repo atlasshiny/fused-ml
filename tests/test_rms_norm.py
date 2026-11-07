@@ -161,6 +161,46 @@ def test_backward_many_rows_reduces_partials():
 
 
 @requires_cuda
+def test_backward_hidden_dim_at_fused_limit():
+    """H=8192 still goes through the fused single-pass backward."""
+    torch.manual_seed(0)
+    batch, hidden = 4, 8192
+    x = torch.randn(batch, hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight_ref).backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-4, atol=1e-5)
+
+
+@requires_cuda
+def test_backward_hidden_dim_above_fused_limit():
+    """H>8192 falls back to the tiled dx + dw kernels."""
+    torch.manual_seed(0)
+    batch, hidden = 2, 16384
+    x = torch.randn(batch, hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.float32, requires_grad=True)
+    grad_out = torch.randn_like(x)
+
+    y = rms_norm(x, weight)
+    y.backward(grad_out)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    _reference(x_ref, weight_ref).backward(grad_out)
+
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-4, atol=1e-5)
+
+
+@requires_cuda
 def test_backward_3d_input():
     torch.manual_seed(0)
     seq, batch, hidden = 4, 8, 512
